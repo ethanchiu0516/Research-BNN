@@ -1,0 +1,56 @@
+import torch
+import torch.nn as nn
+import torch.optim as optim
+
+#XOR training data
+x = torch.tensor([[0, 0], [0, 1], [1, 0], [1, 1]], dtype = torch.float32)
+y = torch.tensor([[0], [1], [1], [0]], dtype = torch.float32)
+
+
+class ThreeLayerNN(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.layer1 = nn.Linear(2, 4)
+        self.layer2 = nn.Linear(4, 3)
+        self.output = nn.Linear(3, 1)
+
+    def forward(self, x):
+        #print("compile forward")
+        x = torch.sigmoid(self.layer1(x)) #xWt + b
+        x = torch.sigmoid(self.layer2(x))
+        x = torch.sigmoid(self.output(x))
+
+        return x
+
+#MSE and SGD
+model = ThreeLayerNN()
+criterion = nn.MSELoss()
+optimizer = optim.SGD(model.parameters(), lr = 0.1)
+
+
+#train
+for epoch in range(100000):
+    optimizer.zero_grad()
+    output = model(x)
+    loss = criterion(output, y)
+    loss.backward()
+    optimizer.step()
+
+    if epoch % 1000 == 0:
+        print(f"Epoch {epoch}, Loss: {loss.item(): .4f}")
+#prediction
+print("\n final prediction:")
+print(model(x).detach().numpy())
+
+print(model)
+for name, param in model.state_dict().items():
+    print(name, param.shape)
+print("\n")
+for param in model.parameters():
+    print(param.shape)
+print("\n")
+
+def hook_fn(module, input, output):
+    print(f"{module}: {output.shape}")
+model.output.register_forward_hook(hook_fn)
+model(x)
