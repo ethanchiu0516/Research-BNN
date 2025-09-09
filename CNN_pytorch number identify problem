@@ -73,3 +73,16 @@ for images, labels in dataiter:
     plt.title(f"Predicted: {model(images[0].unsqueeze(0)).argmax().item()}, Actual: {labels[0].item()}")
     plt.show()
 
+
+# evaluate accuracy
+correct = 0
+total = 0
+model.eval()  # 切到評估模式，關閉 dropout/batchnorm 等
+with torch.no_grad():  # 減少記憶體和加快運算
+    for images, labels in testloader:
+        outputs = model(images)
+        _, predicted = torch.max(outputs, 1)  # 取最大值的 index
+        total += labels.size(0)
+        correct += (predicted == labels).sum().item()
+
+print(f"Accuracy on test set: {100 * correct / total:.2f}%")
