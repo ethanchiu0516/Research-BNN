@@ -1,0 +1,107 @@
+import torch
+import torch.nn as nn
+import torch.optim as optim
+import torchvision
+import torchvision.transforms as transforms
+import matplotlib.pyplot as plt
+
+#import data
+
+#定義數據轉換
+transform = transforms.Compose([transforms.ToTensor(), transforms.Normalize((0.5, ), (0.5, ))])
+
+#download data and training data
+trainset = torchvision.datasets.MNIST(root = './data', train = True, download = True, transform = transform)
+testset = torchvision.datasets.MNIST(root = './data', train = False, download = True, transform = transform)
+
+#Using DataLoaderto split dataset
+trainloader = torch.utils.data.DataLoader(trainset, batch_size = 64, shuffle= True)
+testloader = torch.utils.data.DataLoader(testset, batch_size = 64, shuffle = False)
+
+#CNN model
+class Net(nn.Module):
+    def __init__(self):
+        super(Net, self).__init__()
+        self.conv1 = nn.Conv2d(1, 32, kernel_size = 3, padding = 1) #input 1 -> output 32
+        self.conv2 = nn.Conv2d(32, 64, kernel_size = 3, padding = 1) #input 32 -> output 64
+        self.fc1 = nn.Linear(7*7*64, 128)
+        self.fc2 = nn.Linear(128, 10)
+
+    def forward(self, x):
+        #convolution + activation + pool
+        x = torch.relu(self.conv1(x))
+        x = torch.max_pool2d(x, 2)
+        x = torch.relu(self.conv2(x))
+        x = torch.max_pool2d(x, 2)
+
+        #to 1 dim
+        x = x.view(-1, 7*7*64)
+        x = torch.relu(self.fc1(x))
+        x = self.fc2(x)
+
+        return x
+        
+#real lasso 
+lambda_l1 = 1e-5          # L1 強度
+lr_conv1  = 0.01          # conv1 的學習率，通常與下方 SGD 一致即可
+
+model = Net()
+criterion = nn.CrossEntropyLoss()
+
+# 只訓練 conv2、fc1、fc2 用 SGD；conv1 由我們手動做 Lasso 近端步驟
+other_params = [p for n, p in model.named_parameters() if not n.startswith('conv1.')]
+optimizer = optim.SGD(other_params, lr=0.01, momentum=0.9)
+
+def soft_threshold(w, thr):
+    return torch.sign(w) * torch.clamp(w.abs() - thr, min=0.0)
+
+# ---- training with proximal L1 step on conv1 ----
+for epoch in range(5):
+    model.train()
+    running_loss = 0.0
+    for i, (inputs, labels) in enumerate(trainloader):
+        optimizer.zero_grad()
+
+        outputs = model(inputs)
+        ce = criterion(outputs, labels)
+        ce.backward()  # 反傳，會同時得到 conv1 與其他層的梯度
+
+        # 1) 先更新「非 conv1」參數（SGD）
+        optimizer.step()
+
+        # 2) 對 conv1 做一次「梯度步 + 近端軟閾值」= 真·Lasso 的 ISTA 一步
+        with torch.no_grad():
+            # 梯度步
+            model.conv1.weight -= lr_conv1 * model.conv1.weight.grad
+            if model.conv1.bias is not None:
+                model.conv1.bias   -= lr_conv1 * model.conv1.bias.grad
+
+            # 近端步（soft-thresholding）
+            model.conv1.weight.copy_(soft_threshold(model.conv1.weight, lr_conv1 * lambda_l1))
+            # 若也想對 bias 做 L1（多數情況不建議），解除下行註解並給一個 bias 的 lambda
+            # model.conv1.bias.copy_(soft_threshold(model.conv1.bias, lr_conv1 * lambda_l1))
+
+            # 清掉已用過的梯度
+            model.conv1.weight.grad.zero_()
+            if model.conv1.bias is not None:
+                model.conv1.bias.grad.zero_()
+
+        running_loss += ce.item()
+        if i % 100 == 99:
+            print(f"[Epoch {epoch+1}, Batch {i+1}] loss: {running_loss/100:.3f}")
+            running_loss = 0.0
+
+print("finished training")
+
+# ---- evaluate accuracy ----
+model.eval()
+correct, total = 0, 0
+with torch.no_grad():
+    for images, labels in testloader:
+        outputs = model(images)
+        pred = outputs.argmax(dim=1)
+        total += labels.size(0)
+        correct += (pred == labels).sum().item()
+print(f"Accuracy on test set: {100*correct/total:.2f}%")
+
+
