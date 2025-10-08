@@ -1,0 +1,628 @@
+import torch
+import torch.nn as nn
+import torch.optim as optim
+import torchvision
+import torchvision.transforms as transforms
+import matplotlib.pyplot as plt
+
+#import data
+
+#定義數據轉換
+transform = transforms.Compose([transforms.ToTensor(), transforms.Normalize((0.5, ), (0.5, ))])
+
+#download data and training data
+trainset = torchvision.datasets.MNIST(root = './data', train = True, download = True, transform = transform)
+testset = torchvision.datasets.MNIST(root = './data', train = False, download = True, transform = transform)
+
+#Using DataLoaderto split dataset
+trainloader = torch.utils.data.DataLoader(trainset, batch_size = 64, shuffle= True)
+testloader = torch.utils.data.DataLoader(testset, batch_size = 64, shuffle = False)
+
+#CNN model
+class Net(nn.Module):
+    def __init__(self):
+        super(Net, self).__init__()
+        self.conv1 = nn.Conv2d(1, 32, kernel_size = 3, padding = 1) #input 1 -> output 32
+        self.conv2 = nn.Conv2d(32, 64, kernel_size = 3, padding = 1) #input 32 -> output 64
+        self.fc1 = nn.Linear(7*7*64, 128)
+        self.fc2 = nn.Linear(128, 10)
+
+    def forward(self, x):
+        #convolution + activation + pool
+        x = torch.relu(self.conv1(x))
+        x = torch.max_pool2d(x, 2)
+        x = torch.relu(self.conv2(x))
+        x = torch.max_pool2d(x, 2)
+
+        #to 1 dim
+        x = x.view(-1, 7*7*64)
+        x = torch.relu(self.fc1(x))
+        x = self.fc2(x)
+
+        return x
+        
+#real lasso
+lambda_l1 = 1e-5          # L1 強度
+lr_conv1  = 0.01          # conv1 的學習率，通常與下方 SGD 一致即可
+
+model = Net()
+criterion = nn.CrossEntropyLoss()
+
+# 只訓練 conv2、fc1、fc2 用 SGD；conv1 由我們手動做 Lasso 近端步驟
+other_params = [p for n, p in model.named_parameters() if not n.startswith('conv1.')]
+optimizer = optim.SGD(other_params, lr=0.01, momentum=0.9)
+
+def soft_threshold(w, thr):
+    return torch.sign(w) * torch.clamp(w.abs() - thr, min=0.0)
+
+# ---- training with proximal L1 step on conv1 ----
+for epoch in range(5):
+    model.train()
+    running_loss = 0.0
+    for i, (inputs, labels) in enumerate(trainloader):
+        optimizer.zero_grad()
+
+        outputs = model(inputs)
+        ce = criterion(outputs, labels)
+        ce.backward()  # 反傳，會同時得到 conv1 與其他層的梯度
+
+        # 1) 先更新「非 conv1」參數（SGD）
+        optimizer.step()
+
+        # 2) 對 conv1 做一次「梯度步 + 近端軟閾值」= 真·Lasso 的 ISTA 一步
+        with torch.no_grad():
+            # 梯度步
+            model.conv1.weight -= lr_conv1 * model.conv1.weight.grad
+            if model.conv1.bias is not None:
+                model.conv1.bias   -= lr_conv1 * model.conv1.bias.grad
+
+            # 近端步（soft-thresholding）
+            model.conv1.weight.copy_(soft_threshold(model.conv1.weight, lr_conv1 * lambda_l1))
+            # 若也想對 bias 做 L1（多數情況不建議），解除下行註解並給一個 bias 的 lambda
+            # model.conv1.bias.copy_(soft_threshold(model.conv1.bias, lr_conv1 * lambda_l1))
+
+            # 清掉已用過的梯度
+            model.conv1.weight.grad.zero_()
+            if model.conv1.bias is not None:
+                model.conv1.bias.grad.zero_()
+
+        running_loss += ce.item()
+        if i % 100 == 99:
+            print(f"[Epoch {epoch+1}, Batch {i+1}] loss: {running_loss/100:.3f}")
+            running_loss = 0.0
+
+print("finished training")
+
+# ---- evaluate accuracy ----
+model.eval()
+correct, total = 0, 0
+with torch.no_grad():
+    for images, labels in testloader:
+        outputs = model(images)
+        pred = outputs.argmax(dim=1)
+        total += labels.size(0)
+        correct += (pred == labels).sum().item()
+print(f"Accuracy on test set: {100*correct/total:.2f}%")
+
+
+
+
+###############################################################
+import torch
+import torch.nn as nn
+import torch.optim as optim
+import torchvision
+import torchvision.transforms as transforms
+import matplotlib.pyplot as plt
+import numpy as np
+
+# 定義數據轉換
+transform = transforms.Compose([transforms.ToTensor(), transforms.Normalize((0.5, ), (0.5, ))])
+
+# 下載數據和訓練數據
+trainset = torchvision.datasets.MNIST(root = './data', train = True, download = True, transform = transform)
+testset = torchvision.datasets.MNIST(root = './data', train = False, download = True, transform = transform)
+
+# 使用DataLoader來分割數據集
+trainloader = torch.utils.data.DataLoader(trainset, batch_size = 64, shuffle= True)
+testloader = torch.utils.data.DataLoader(testset, batch_size = 64, shuffle = False)
+
+# CNN模型
+class Net(nn.Module):
+    def __init__(self):
+        super(Net, self).__init__()
+        self.conv1 = nn.Conv2d(1, 32, kernel_size = 3, padding = 1) # input 1 -> output 32
+        self.conv2 = nn.Conv2d(32, 64, kernel_size = 3, padding = 1) # input 32 -> output 64
+        self.fc1 = nn.Linear(7*7*64, 128)
+        self.fc2 = nn.Linear(128, 10)
+
+    def forward(self, x):
+        # 卷積 + 激活 + 池化
+        x = torch.relu(self.conv1(x))
+        x = torch.max_pool2d(x, 2)
+        x = torch.relu(self.conv2(x))
+        x = torch.max_pool2d(x, 2)
+
+        # 轉換為1維
+        x = x.view(-1, 7*7*64)
+        x = torch.relu(self.fc1(x))
+        x = self.fc2(x)
+
+        return x
+
+# 顯示conv1的結構和權重
+def visualize_conv1(model, epoch=None):
+    conv1_weight = model.conv1.weight.data.cpu().numpy()
+    conv1_bias = model.conv1.bias.data.cpu().numpy() if model.conv1.bias is not None else None
+    
+    print(f"\n=== conv1 權重資訊 (Epoch {epoch if epoch else '初始'}) ===")
+    print(f"權重形狀: {conv1_weight.shape}")  # [輸出通道數, 輸入通道數, 卷積核高度, 卷積核寬度]
+    print(f"權重範圍: [{conv1_weight.min():.4f}, {conv1_weight.max():.4f}]")
+    print(f"權重絕對值平均: {np.abs(conv1_weight).mean():.4f}")
+    print(f"零權重比例: {(conv1_weight == 0).mean():.2%}")
+    
+    if conv1_bias is not None:
+        print(f"偏置形狀: {conv1_bias.shape}")
+        print(f"偏置範圍: [{conv1_bias.min():.4f}, {conv1_bias.max():.4f}]")
+    
+    # 視覺化卷積核
+    fig, axes = plt.subplots(4, 8, figsize=(12, 6))
+    fig.suptitle(f'conv1 卷積核可視化 (Epoch {epoch if epoch else "初始"})')
+    
+    for i, ax in enumerate(axes.flat):
+        if i < conv1_weight.shape[0]:  # 只顯示前32個卷積核
+            kernel = conv1_weight[i, 0]  # 取第一個輸入通道的權重
+            im = ax.imshow(kernel, cmap='RdBu', vmin=-0.5, vmax=0.5)
+            ax.set_title(f'Filter {i}')
+            ax.axis('off')
+        else:
+            ax.axis('off')
+    
+    plt.tight_layout()
+    plt.show()
+    
+    # 顯示權重分佈直方圖
+    plt.figure(figsize=(10, 4))
+    plt.subplot(1, 2, 1)
+    plt.hist(conv1_weight.flatten(), bins=50, alpha=0.7, color='blue')
+    plt.title('conv1 權重分佈')
+    plt.xlabel('權重值')
+    plt.ylabel('頻率')
+    
+    plt.subplot(1, 2, 2)
+    plt.hist(np.abs(conv1_weight.flatten()), bins=50, alpha=0.7, color='red', log=True)
+    plt.title('conv1 權重絕對值分佈 (對數座標)')
+    plt.xlabel('權重絕對值')
+    plt.ylabel('頻率 (對數)')
+    
+    plt.tight_layout()
+    plt.show()
+
+# 顯示conv1的feature map
+def visualize_feature_maps(model, sample_input, epoch=None):
+    model.eval()
+    with torch.no_grad():
+        # 取得conv1的輸出（在ReLU激活之前和之後都看一下）
+        conv1_output = model.conv1(sample_input.unsqueeze(0))  # 添加batch維度
+        relu_output = torch.relu(conv1_output)
+        pooled_output = torch.max_pool2d(relu_output, 2)
+    
+    # 轉換為numpy
+    conv1_out_np = conv1_output.squeeze(0).cpu().numpy()  # [32, 28, 28]
+    relu_out_np = relu_output.squeeze(0).cpu().numpy()    # [32, 28, 28]
+    pooled_out_np = pooled_output.squeeze(0).cpu().numpy() # [32, 14, 14]
+    
+    print(f"\n=== conv1 Feature Map 資訊 (Epoch {epoch if epoch else '初始'}) ===")
+    print(f"輸入圖像形狀: {sample_input.shape}")
+    print(f"conv1 輸出形狀: {conv1_out_np.shape}")
+    print(f"ReLU 後形狀: {relu_out_np.shape}")
+    print(f"池化後形狀: {pooled_out_np.shape}")
+    
+    # 顯示原始輸入圖像
+    plt.figure(figsize=(15, 10))
+    
+    # 原始圖像
+    plt.subplot(4, 1, 1)
+    plt.imshow(sample_input.squeeze().cpu().numpy(), cmap='gray')
+    plt.title('原始輸入圖像')
+    plt.axis('off')
+    
+    # 顯示幾個代表性的feature maps
+    feature_indices = [0, 1, 2, 3, 15, 16, 17, 31]  # 選擇幾個有代表性的濾波器
+    
+    # conv1輸出（激活前）
+    plt.subplot(4, 8, 9)
+    for i, idx in enumerate(feature_indices):
+        plt.subplot(4, 8, 9 + i)
+        plt.imshow(conv1_out_np[idx], cmap='RdBu', vmin=-1, vmax=1)
+        plt.title(f'Conv {idx}')
+        plt.axis('off')
+    plt.suptitle('conv1 輸出 (激活前)', y=0.65)
+    
+    # ReLU後
+    plt.subplot(4, 8, 17)
+    for i, idx in enumerate(feature_indices):
+        plt.subplot(4, 8, 17 + i)
+        plt.imshow(relu_out_np[idx], cmap='hot', vmin=0, vmax=2)
+        plt.title(f'ReLU {idx}')
+        plt.axis('off')
+    plt.suptitle('ReLU 激活後', y=0.35)
+    
+    # 池化後
+    plt.subplot(4, 8, 25)
+    for i, idx in enumerate(feature_indices):
+        plt.subplot(4, 8, 25 + i)
+        plt.imshow(pooled_out_np[idx], cmap='hot', vmin=0, vmax=2)
+        plt.title(f'Pool {idx}')
+        plt.axis('off')
+    plt.suptitle('Max Pooling 後', y=0.05)
+    
+    plt.tight_layout()
+    plt.show()
+    
+    # 顯示所有32個feature maps的縮圖
+    fig, axes = plt.subplots(4, 8, figsize=(16, 8))
+    fig.suptitle(f'conv1 所有32個Feature Maps - ReLU後 (Epoch {epoch if epoch else "初始"})')
+    for i, ax in enumerate(axes.flat):
+        if i < 32:
+            ax.imshow(relu_out_np[i], cmap='hot')
+            ax.set_title(f'FM {i}')
+            ax.axis('off')
+    plt.tight_layout()
+    plt.show()
+
+# 真實Lasso參數
+lambda_l1 = 1e-5          # L1 強度
+lr_conv1  = 0.01          # conv1 的學習率
+
+model = Net()
+criterion = nn.CrossEntropyLoss()
+
+# 獲取一個樣本圖像用於可視化
+sample_data = next(iter(trainloader))
+sample_image, sample_label = sample_data[0][0], sample_data[1][0]  # 取第一個樣本
+
+print("初始模型conv1權重:")
+visualize_conv1(model, "初始")
+print("\n初始模型conv1 feature maps:")
+visualize_feature_maps(model, sample_image, "初始")
+
+# 只訓練 conv2、fc1、fc2 用 SGD；conv1 由我們手動做 Lasso 近端步驟
+other_params = [p for n, p in model.named_parameters() if not n.startswith('conv1.')]
+optimizer = optim.SGD(other_params, lr=0.01, momentum=0.9)
+
+def soft_threshold(w, thr):
+    return torch.sign(w) * torch.clamp(w.abs() - thr, min=0.0)
+
+# ---- 訓練並定期顯示conv1權重和feature maps ----
+for epoch in range(5):
+    model.train()
+    running_loss = 0.0
+    for i, (inputs, labels) in enumerate(trainloader):
+        optimizer.zero_grad()
+
+        outputs = model(inputs)
+        ce = criterion(outputs, labels)
+        ce.backward()  # 反傳，會同時得到 conv1 與其他層的梯度
+
+        # 1) 先更新「非 conv1」參數（SGD）
+        optimizer.step()
+
+        # 2) 對 conv1 做一次「梯度步 + 近端軟閾值」= 真·Lasso 的 ISTA 一步
+        with torch.no_grad():
+            # 梯度步
+            model.conv1.weight -= lr_conv1 * model.conv1.weight.grad
+            if model.conv1.bias is not None:
+                model.conv1.bias   -= lr_conv1 * model.conv1.bias.grad
+
+            # 近端步（soft-thresholding）
+            model.conv1.weight.copy_(soft_threshold(model.conv1.weight, lr_conv1 * lambda_l1))
+
+            # 清掉已用過的梯度
+            model.conv1.weight.grad.zero_()
+            if model.conv1.bias is not None:
+                model.conv1.bias.grad.zero_()
+
+        running_loss += ce.item()
+        if i % 100 == 99:
+            print(f"[Epoch {epoch+1}, Batch {i+1}] loss: {running_loss/100:.3f}")
+            running_loss = 0.0
+    
+    # 每個epoch結束後顯示conv1權重和feature maps
+    print(f"\n=== Epoch {epoch+1} 結束 ===")
+    visualize_conv1(model, epoch+1)
+    visualize_feature_maps(model, sample_image, epoch+1)
+
+print("訓練完成")
+
+# ---- 評估準確度 ----
+model.eval()
+correct, total = 0, 0
+with torch.no_grad():
+    for images, labels in testloader:
+        outputs = model(images)
+        pred = outputs.argmax(dim=1)
+        total += labels.size(0)
+        correct += (pred == labels).sum().item()
+print(f"測試集準確率: {100*correct/total:.2f}%")
+
+# 最終conv1權重和feature maps顯示
+print("\n最終模型conv1權重:")
+visualize_conv1(model, "最終")
+print("\n最終模型conv1 feature maps:")
+visualize_feature_maps(model, sample_image, "最終")
+
+
+#######################################################################################
+import torch
+import torch.nn as nn
+import torch.optim as optim
+import torchvision
+import torchvision.transforms as transforms
+import matplotlib.pyplot as plt
+import numpy as np
+
+# 定義數據轉換
+transform = transforms.Compose([transforms.ToTensor(), transforms.Normalize((0.5, ), (0.5, ))])
+
+# 下載數據和訓練數據
+trainset = torchvision.datasets.MNIST(root = './data', train = True, download = True, transform = transform)
+testset = torchvision.datasets.MNIST(root = './data', train = False, download = True, transform = transform)
+
+# 使用DataLoader來分割數據集
+trainloader = torch.utils.data.DataLoader(trainset, batch_size = 64, shuffle= True)
+testloader = torch.utils.data.DataLoader(testset, batch_size = 64, shuffle = False)
+
+# CNN模型
+class Net(nn.Module):
+    def __init__(self):
+        super(Net, self).__init__()
+        self.conv1 = nn.Conv2d(1, 32, kernel_size = 3, padding = 1) # input 1 -> output 32
+        self.conv2 = nn.Conv2d(32, 64, kernel_size = 3, padding = 1) # input 32 -> output 64
+        self.fc1 = nn.Linear(7*7*64, 128)
+        self.fc2 = nn.Linear(128, 10)
+
+    def forward(self, x):
+        # 卷積 + 激活 + 池化
+        x = torch.relu(self.conv1(x))
+        x = torch.max_pool2d(x, 2)
+        x = torch.relu(self.conv2(x))
+        x = torch.max_pool2d(x, 2)
+
+        # 轉換為1維
+        x = x.view(-1, 7*7*64)
+        x = torch.relu(self.fc1(x))
+        x = self.fc2(x)
+
+        return x
+
+# 顯示conv1的結構和權重
+def visualize_conv1(model, epoch=None):
+    conv1_weight = model.conv1.weight.data.cpu().numpy()
+    conv1_bias = model.conv1.bias.data.cpu().numpy() if model.conv1.bias is not None else None
+    
+    print(f"\n=== conv1 權重資訊 (Epoch {epoch if epoch else '初始'}) ===")
+    print(f"權重形狀: {conv1_weight.shape}")  # [輸出通道數, 輸入通道數, 卷積核高度, 卷積核寬度]
+    print(f"權重範圍: [{conv1_weight.min():.4f}, {conv1_weight.max():.4f}]")
+    print(f"權重絕對值平均: {np.abs(conv1_weight).mean():.4f}")
+    print(f"零權重比例: {(conv1_weight == 0).mean():.2%}")
+    
+    if conv1_bias is not None:
+        print(f"偏置形狀: {conv1_bias.shape}")
+        print(f"偏置範圍: [{conv1_bias.min():.4f}, {conv1_bias.max():.4f}]")
+    
+    # 視覺化卷積核
+    fig, axes = plt.subplots(4, 8, figsize=(12, 6))
+    fig.suptitle(f'conv1 卷積核可視化 (Epoch {epoch if epoch else "初始"})')
+    
+    for i, ax in enumerate(axes.flat):
+        if i < conv1_weight.shape[0]:  # 只顯示前32個卷積核
+            kernel = conv1_weight[i, 0]  # 取第一個輸入通道的權重
+            im = ax.imshow(kernel, cmap='RdBu', vmin=-0.5, vmax=0.5)
+            ax.set_title(f'Filter {i}')
+            ax.axis('off')
+        else:
+            ax.axis('off')
+    
+    plt.tight_layout()
+    plt.show()
+    
+    # 顯示權重分佈直方圖
+    plt.figure(figsize=(10, 4))
+    plt.subplot(1, 2, 1)
+    plt.hist(conv1_weight.flatten(), bins=50, alpha=0.7, color='blue')
+    plt.title('conv1 權重分佈')
+    plt.xlabel('權重值')
+    plt.ylabel('頻率')
+    
+    plt.subplot(1, 2, 2)
+    plt.hist(np.abs(conv1_weight.flatten()), bins=50, alpha=0.7, color='red', log=True)
+    plt.title('conv1 權重絕對值分佈 (對數座標)')
+    plt.xlabel('權重絕對值')
+    plt.ylabel('頻率 (對數)')
+    
+    plt.tight_layout()
+    plt.show()
+
+# 顯示conv1的feature map數值矩陣
+def print_feature_map_values(model, sample_input, epoch=None, num_channels=5):
+    model.eval()
+    with torch.no_grad():
+        # 取得conv1的輸出（在ReLU激活之前和之後都看一下）
+        conv1_output = model.conv1(sample_input.unsqueeze(0))  # 添加batch維度
+        relu_output = torch.relu(conv1_output)
+        pooled_output = torch.max_pool2d(relu_output, 2)
+    
+    # 轉換為numpy
+    conv1_out_np = conv1_output.squeeze(0).cpu().numpy()  # [32, 28, 28]
+    relu_out_np = relu_output.squeeze(0).cpu().numpy()    # [32, 28, 28]
+    pooled_out_np = pooled_output.squeeze(0).cpu().numpy() # [32, 14, 14]
+    
+    print(f"\n=== conv1 Feature Map 數值矩陣 (Epoch {epoch if epoch else '初始'}) ===")
+    print(f"輸入圖像形狀: {sample_input.shape}")
+    print(f"conv1 輸出形狀: {conv1_out_np.shape}")
+    print(f"ReLU 後形狀: {relu_out_np.shape}")
+    print(f"池化後形狀: {pooled_out_np.shape}")
+    
+    # 顯示前幾個channel的數值矩陣
+    for channel in range(min(num_channels, 32)):
+        print(f"\n--- Channel {channel} ---")
+        
+        print("1. conv1 輸出 (激活前) - 左上角 8x8 區域:")
+        print_matrix(conv1_out_np[channel, :8, :8])
+        
+        print("\n2. ReLU 後 - 左上角 8x8 區域:")
+        print_matrix(relu_out_np[channel, :8, :8])
+        
+        print("\n3. 池化後 - 完整 14x14 矩陣:")
+        print_matrix(pooled_out_np[channel])
+        
+        print(f"\nChannel {channel} 統計資訊:")
+        print(f"  conv1輸出: 最小值={conv1_out_np[channel].min():.4f}, 最大值={conv1_out_np[channel].max():.4f}, 平均值={conv1_out_np[channel].mean():.4f}")
+        print(f"  ReLU後: 最小值={relu_out_np[channel].min():.4f}, 最大值={relu_out_np[channel].max():.4f}, 平均值={relu_out_np[channel].mean():.4f}")
+        print(f"  池化後: 最小值={pooled_out_np[channel].min():.4f}, 最大值={pooled_out_np[channel].max():.4f}, 平均值={pooled_out_np[channel].mean():.4f}")
+        
+        print("-" * 50)
+
+def print_matrix(matrix, precision=4):
+    """格式化輸出矩陣"""
+    if matrix.ndim == 2:
+        for i in range(matrix.shape[0]):
+            row_str = "["
+            for j in range(matrix.shape[1]):
+                if j > 0:
+                    row_str += " "
+                row_str += f"{matrix[i,j]:{precision+3}.{precision}f}"
+            row_str += "]"
+            print(row_str)
+    else:
+        print(f"矩陣形狀: {matrix.shape}")
+
+# 可選：保存feature map到文件
+def save_feature_maps_to_file(model, sample_input, epoch=None, filename_prefix="feature_maps"):
+    model.eval()
+    with torch.no_grad():
+        conv1_output = model.conv1(sample_input.unsqueeze(0))
+        relu_output = torch.relu(conv1_output)
+        pooled_output = torch.max_pool2d(relu_output, 2)
+    
+    conv1_out_np = conv1_output.squeeze(0).cpu().numpy()
+    relu_out_np = relu_output.squeeze(0).cpu().numpy()
+    pooled_out_np = pooled_output.squeeze(0).cpu().numpy()
+    
+    # 保存為numpy文件
+    if epoch is not None:
+        filename = f"{filename_prefix}_epoch{epoch}.npz"
+    else:
+        filename = f"{filename_prefix}_initial.npz"
+    
+    np.savez(filename, 
+             conv1_output=conv1_out_np,
+             relu_output=relu_out_np, 
+             pooled_output=pooled_out_np)
+    
+    print(f"Feature maps 已保存到: {filename}")
+    
+    # 也保存為文本文件（前幾個channel）
+    txt_filename = filename.replace('.npz', '_sample.txt')
+    with open(txt_filename, 'w') as f:
+        f.write(f"Feature Maps - Epoch {epoch if epoch else 'initial'}\n")
+        f.write("="*50 + "\n")
+        
+        for channel in range(min(3, 32)):
+            f.write(f"\nChannel {channel}:\n")
+            f.write("conv1輸出 (前5x5):\n")
+            np.savetxt(f, conv1_out_np[channel, :5, :5], fmt='%8.4f')
+            f.write("\nReLU後 (前5x5):\n")
+            np.savetxt(f, relu_out_np[channel, :5, :5], fmt='%8.4f')
+            f.write("\n池化後 (完整):\n")
+            np.savetxt(f, pooled_out_np[channel], fmt='%8.4f')
+            f.write("\n" + "-"*30 + "\n")
+    
+    print(f"樣本數值已保存到: {txt_filename}")
+
+# 真實Lasso參數
+lambda_l1 = 1e-5          # L1 強度
+lr_conv1  = 0.01          # conv1 的學習率
+
+model = Net()
+criterion = nn.CrossEntropyLoss()
+
+# 獲取一個樣本圖像用於可視化
+sample_data = next(iter(trainloader))
+sample_image, sample_label = sample_data[0][0], sample_data[1][0]  # 取第一個樣本
+
+print("初始模型conv1權重:")
+visualize_conv1(model, "初始")
+print("\n初始模型conv1 feature maps 數值:")
+print_feature_map_values(model, sample_image, "初始")
+
+# 可選：保存到文件
+save_feature_maps_to_file(model, sample_image, "初始")
+
+# 只訓練 conv2、fc1、fc2 用 SGD；conv1 由我們手動做 Lasso 近端步驟
+other_params = [p for n, p in model.named_parameters() if not n.startswith('conv1.')]
+optimizer = optim.SGD(other_params, lr=0.01, momentum=0.9)
+
+def soft_threshold(w, thr):
+    return torch.sign(w) * torch.clamp(w.abs() - thr, min=0.0)
+
+# ---- 訓練並定期顯示conv1權重和feature maps ----
+for epoch in range(5):
+    model.train()
+    running_loss = 0.0
+    for i, (inputs, labels) in enumerate(trainloader):
+        optimizer.zero_grad()
+
+        outputs = model(inputs)
+        ce = criterion(outputs, labels)
+        ce.backward()  # 反傳，會同時得到 conv1 與其他層的梯度
+
+        # 1) 先更新「非 conv1」參數（SGD）
+        optimizer.step()
+
+        # 2) 對 conv1 做一次「梯度步 + 近端軟閾值」= 真·Lasso 的 ISTA 一步
+        with torch.no_grad():
+            # 梯度步
+            model.conv1.weight -= lr_conv1 * model.conv1.weight.grad
+            if model.conv1.bias is not None:
+                model.conv1.bias   -= lr_conv1 * model.conv1.bias.grad
+
+            # 近端步（soft-thresholding）
+            model.conv1.weight.copy_(soft_threshold(model.conv1.weight, lr_conv1 * lambda_l1))
+
+            # 清掉已用過的梯度
+            model.conv1.weight.grad.zero_()
+            if model.conv1.bias is not None:
+                model.conv1.bias.grad.zero_()
+
+        running_loss += ce.item()
+        if i % 100 == 99:
+            print(f"[Epoch {epoch+1}, Batch {i+1}] loss: {running_loss/100:.3f}")
+            running_loss = 0.0
+    
+    # 每個epoch結束後顯示conv1權重和feature maps
+    print(f"\n=== Epoch {epoch+1} 結束 ===")
+    visualize_conv1(model, epoch+1)
+    print_feature_map_values(model, sample_image, epoch+1)
+    save_feature_maps_to_file(model, sample_image, epoch+1)
+
+print("訓練完成")
+
+# ---- 評估準確度 ----
+model.eval()
+correct, total = 0, 0
+with torch.no_grad():
+    for images, labels in testloader:
+        outputs = model(images)
+        pred = outputs.argmax(dim=1)
+        total += labels.size(0)
+        correct += (pred == labels).sum().item()
+print(f"測試集準確率: {100*correct/total:.2f}%")
+
+# 最終conv1權重和feature maps顯示
+print("\n最終模型conv1權重:")
+visualize_conv1(model, "最終")
+print("\n最終模型conv1 feature maps 數值:")
+print_feature_map_values(model, sample_image, "最終")
+save_feature_maps_to_file(model, sample_image, "最終")
