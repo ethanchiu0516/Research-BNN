@@ -1,0 +1,278 @@
+import torch
+import torch.nn as nn
+import torchvision
+import torchvision.transforms as transforms
+import matplotlib.pyplot as plt
+import numpy as np
+
+def print_full_matrix(matrix, title="", max_display_rows=28, max_display_cols=28):
+    """輸出完整矩陣，可控制顯示的行列數"""
+    if matrix.ndim != 2:
+        print(f"矩陣形狀: {matrix.shape}")
+        return
+    
+    rows, cols = matrix.shape
+    display_rows = min(rows, max_display_rows)
+    display_cols = min(cols, max_display_cols)
+    
+    print(f"\n{title}")
+    print(f"矩陣形狀: {rows} x {cols}")
+    print(f"顯示: {display_rows} x {display_cols} (完整: {rows} x {cols})")
+    print(f"數值範圍: [{matrix.min():.6f}, {matrix.max():.6f}]")
+    print(f"平均值: {matrix.mean():.6f}")
+    
+    print("矩陣內容:")
+    print("┌" + "─" * (display_cols * 12 + 1) + "┐")
+    for i in range(display_rows):
+        row_str = "│"
+        for j in range(display_cols):
+            row_str += f" {matrix[i,j]:9.6f}"
+        if display_cols < cols:
+            row_str += " ..."
+        row_str += " │"
+        print(row_str)
+    
+    if display_rows < rows:
+        print("│" + " ...".center(display_cols * 12 + 1) + "│")
+    
+    print("└" + "─" * (display_cols * 12 + 1) + "┘")
+
+def test_single_image_with_full_matrices(model, testloader, image_index=0):
+    """
+    測試單張圖片並顯示完整的矩陣輸出
+    """
+    # 獲取測試集中的單張圖片
+    model.eval()
+    test_data = list(testloader)
+    images, labels = test_data[0]
+    
+    # 選擇指定索引的圖片
+    single_image = images[image_index:image_index+1]
+    single_label = labels[image_index:image_index+1]
+    
+    print(f"\n{'='*100}")
+    print(f"測試單張圖片 (索引: {image_index}, 真實標籤: {single_label.item()})")
+    print(f"{'='*100}")
+    
+    with torch.no_grad():
+        # 1. 顯示原始輸入圖片
+        print(f"\n📥 1. 原始輸入圖片:")
+        input_matrix = single_image.squeeze().cpu().numpy()
+        print_full_matrix(input_matrix, "輸入圖片矩陣 (28x28)")
+        
+        plt.figure(figsize=(15, 4))
+        plt.subplot(1, 4, 1)
+        plt.imshow(input_matrix, cmap='gray')
+        plt.title(f'輸入圖片\n數字: {single_label.item()}')
+        plt.axis('off')
+        
+        # 2. CONV1 輸出 - 顯示多個通道的完整矩陣
+        conv1_output = model.conv1(single_image)
+        conv1_output_np = conv1_output.squeeze(0).cpu().numpy()  # [32, 28, 28]
+        
+        print(f"\n🔄 2. CONV1 層輸出:")
+        print(f"   輸出形狀: {conv1_output.shape}")
+        print(f"   整體數值範圍: [{conv1_output.min():.6f}, {conv1_output.max():.6f}]")
+        
+        # 顯示前3個通道的完整CONV1輸出矩陣
+        for channel in range(min(32, 32)):
+            print_full_matrix(
+                conv1_output_np[channel], 
+                f"CONV1 輸出 - 通道 {channel} 完整矩陣 (28x28)",
+                max_display_rows=28,
+                max_display_cols=28
+            )
+        
+        # 可視化CONV1輸出
+        plt.subplot(1, 4, 2)
+        best_channel = np.argmax(conv1_output_np.mean(axis=(1,2)))
+        plt.imshow(conv1_output_np[best_channel], cmap='RdBu')
+        plt.title(f'CONV1輸出 (Ch{best_channel})\n範圍: [{conv1_output_np[best_channel].min():.3f}, {conv1_output_np[best_channel].max():.3f}]')
+        plt.axis('off')
+        plt.colorbar()
+        
+        # 3. ReLU 激活輸出 - 顯示多個通道的完整矩陣
+        relu_output = torch.relu(conv1_output)
+        relu_output_np = relu_output.squeeze(0).cpu().numpy()  # [32, 28, 28]
+        
+        print(f"\n🔦 3. ReLU 激活後輸出:")
+        print(f"   輸出形狀: {relu_output.shape}")
+        print(f"   整體數值範圍: [{relu_output.min():.6f}, {relu_output.max():.6f}]")
+        print(f"   整體零值比例: {(relu_output == 0).float().mean():.4%}")
+        
+        # 顯示32個通道的完整ReLU輸出矩陣
+        for channel in range(min(32, 32)):
+            zero_ratio = (relu_output_np[channel] == 0).mean()
+            print_full_matrix(
+                relu_output_np[channel], 
+                f"ReLU 輸出 - 通道 {channel} 完整矩陣 (28x28) - 零值比例: {zero_ratio:.4%}",
+                max_display_rows=28,
+                max_display_cols=28
+            )
+        
+        # 可視化ReLU輸出
+        plt.subplot(1, 4, 3)
+        best_channel_relu = np.argmax(relu_output_np.mean(axis=(1,2)))
+        zero_ratio = (relu_output_np[best_channel_relu] == 0).mean()
+        plt.imshow(relu_output_np[best_channel_relu], cmap='hot')
+        plt.title(f'ReLU後 (Ch{best_channel_relu})\n零值比例: {zero_ratio:.2%}')
+        plt.axis('off')
+        plt.colorbar()
+        
+        # 4. 池化輸出
+        pooled_output = torch.max_pool2d(relu_output, 2)
+        pooled_output_np = pooled_output.squeeze(0).cpu().numpy()  # [32, 14, 14]
+        
+        print(f"\n📏 4. 池化後輸出:")
+        print(f"   輸出形狀: {pooled_output.shape}")
+        print(f"   整體數值範圍: [{pooled_output.min():.6f}, {pooled_output.max():.6f}]")
+        
+        # 顯示32個通道的完整池化輸出矩陣
+        for channel in range(min(32, 32)):
+            print_full_matrix(
+                pooled_output_np[channel], 
+                f"池化輸出 - 通道 {channel} 完整矩陣 (14x14)",
+                max_display_rows=14,
+                max_display_cols=14
+            )
+        
+        # 可視化池化輸出
+        plt.subplot(1, 4, 4)
+        best_channel_pool = np.argmax(pooled_output_np.mean(axis=(1,2)))
+        plt.imshow(pooled_output_np[best_channel_pool], cmap='hot')
+        plt.title(f'池化後 (Ch{best_channel_pool})\n尺寸: 14x14')
+        plt.axis('off')
+        plt.colorbar()
+        
+        plt.tight_layout()
+        plt.show()
+        
+        # 5. 最終辨識結果
+        final_output = model(single_image)
+        probabilities = torch.softmax(final_output, dim=1)
+        predicted_class = torch.argmax(final_output, dim=1).item()
+        confidence = probabilities[0, predicted_class].item()
+        
+        print(f"\n🎯 5. 最終辨識結果:")
+        print(f"   原始輸出: {final_output.squeeze().cpu().numpy()}")
+        print(f"   機率分佈: {probabilities.squeeze().cpu().numpy()}")
+        print(f"   預測數字: {predicted_class}")
+        print(f"   真實數字: {single_label.item()}")
+        print(f"   置信度: {confidence:.6f}")
+        print(f"   結果: {'✅ 正確' if predicted_class == single_label.item() else '❌ 錯誤'}")
+        
+        # 顯示機率分佈圖
+        plt.figure(figsize=(12, 4))
+        
+        plt.subplot(1, 2, 1)
+        x_pos = np.arange(10)
+        probs = probabilities.squeeze().cpu().numpy()
+        colors = ['red' if i == predicted_class else ('green' if i == single_label.item() else 'blue') 
+                 for i in range(10)]
+        
+        bars = plt.bar(x_pos, probs, color=colors, alpha=0.7)
+        plt.xlabel('數字')
+        plt.ylabel('機率')
+        plt.title('各數字預測機率\n(紅色:預測, 綠色:真實, 藍色:其他)')
+        plt.xticks(x_pos)
+        
+        for bar, prob in zip(bars, probs):
+            plt.text(bar.get_x() + bar.get_width()/2, bar.get_height() + 0.01, 
+                    f'{prob:.4f}', ha='center', va='bottom', fontsize=8)
+        
+        plt.subplot(1, 2, 2)
+        # 顯示所有通道的激活統計
+        channel_activations = relu_output.mean(dim=[0, 2, 3]).cpu().numpy()
+        plt.bar(np.arange(len(channel_activations)), channel_activations, alpha=0.7)
+        plt.xlabel('通道索引')
+        plt.ylabel('平均激活值')
+        plt.title('所有32個通道的平均激活')
+        plt.xticks(np.arange(0, 32, 2))
+        
+        plt.tight_layout()
+        plt.show()
+        
+        return {
+            'input_image': single_image,
+            'conv1_output': conv1_output,
+            'relu_output': relu_output,
+            'pooled_output': pooled_output,
+            'final_output': final_output,
+            'predicted': predicted_class,
+            'actual': single_label.item(),
+            'confidence': confidence
+        }
+
+def save_full_matrices_to_file(results, image_index=0):
+    """將完整矩陣保存到文件"""
+    conv1_output_np = results['conv1_output'].squeeze(0).cpu().numpy()
+    relu_output_np = results['relu_output'].squeeze(0).cpu().numpy()
+    pooled_output_np = results['pooled_output'].squeeze(0).cpu().numpy()
+    
+    filename = f"full_matrices_image_{image_index}.txt"
+    
+    with open(filename, 'w', encoding='utf-8') as f:
+        f.write(f"完整矩陣輸出 - 圖片索引: {image_index}\n")
+        f.write(f"真實標籤: {results['actual']}, 預測標籤: {results['predicted']}\n")
+        f.write("="*100 + "\n\n")
+        
+        # 保存CONV1輸出
+        f.write("CONV1 輸出矩陣 (32個通道, 每個28x28):\n")
+        f.write("="*80 + "\n")
+        for channel in range(32):
+            f.write(f"\n通道 {channel}:\n")
+            f.write(f"範圍: [{conv1_output_np[channel].min():.6f}, {conv1_output_np[channel].max():.6f}]\n")
+            f.write(f"平均值: {conv1_output_np[channel].mean():.6f}\n")
+            np.savetxt(f, conv1_output_np[channel], fmt='%10.6f')
+            f.write("\n")
+        
+        # 保存ReLU輸出
+        f.write("\n\nReLU 輸出矩陣 (32個通道, 每個28x28):\n")
+        f.write("="*80 + "\n")
+        for channel in range(32):
+            zero_ratio = (relu_output_np[channel] == 0).mean()
+            f.write(f"\n通道 {channel} (零值比例: {zero_ratio:.4%}):\n")
+            f.write(f"範圍: [{relu_output_np[channel].min():.6f}, {relu_output_np[channel].max():.6f}]\n")
+            f.write(f"平均值: {relu_output_np[channel].mean():.6f}\n")
+            np.savetxt(f, relu_output_np[channel], fmt='%10.6f')
+            f.write("\n")
+        
+        # 保存池化輸出
+        f.write("\n\n池化輸出矩陣 (32個通道, 每個14x14):\n")
+        f.write("="*80 + "\n")
+        for channel in range(32):
+            f.write(f"\n通道 {channel}:\n")
+            f.write(f"範圍: [{pooled_output_np[channel].min():.6f}, {pooled_output_np[channel].max():.6f}]\n")
+            f.write(f"平均值: {pooled_output_np[channel].mean():.6f}\n")
+            np.savetxt(f, pooled_output_np[channel], fmt='%10.6f')
+            f.write("\n")
+    
+    print(f"\n💾 完整矩陣已保存到文件: {filename}")
+
+# 主程式
+def main():
+    # 載入模型和數據
+    #model = Net()
+    transform = transforms.Compose([transforms.ToTensor(), transforms.Normalize((0.5,), (0.5,))])
+    testset = torchvision.datasets.MNIST(root='./data', train=False, download=True, transform=transform)
+    testloader = torch.utils.data.DataLoader(testset, batch_size=64, shuffle=False)
+    
+    print("開始測試單張圖片並顯示完整矩陣...")
+    
+    # 測試圖片
+    results = test_single_image_with_full_matrices(model, testloader, image_index=0)
+    
+    # 保存完整矩陣到文件
+    save_full_matrices_to_file(results, image_index=0)
+    
+    print(f"\n{'='*100}")
+    print("測試完成！")
+    print(f"輸入圖片: 28x28 矩陣")
+    print(f"CONV1輸出: 32個 28x28 矩陣") 
+    print(f"ReLU輸出: 32個 28x28 矩陣")
+    print(f"池化輸出: 32個 14x14 矩陣")
+    print(f"{'='*100}")
+
+# 執行
+if __name__ == "__main__":
+    main()
