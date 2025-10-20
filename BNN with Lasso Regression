@@ -5,6 +5,14 @@ import torchvision
 import torchvision.transforms as transforms
 import matplotlib.pyplot as plt
 import numpy as np
+import torch.nn.functional as F
+from scipy import stats
+import seaborn as sns
+import pandas as pd
+
+# 設定隨機種子以確保可重現性
+torch.manual_seed(42)
+np.random.seed(42)
 
 # 定義數據轉換
 transform = transforms.Compose([transforms.ToTensor(), transforms.Normalize((0.5, ), (0.5, ))])
@@ -17,298 +25,424 @@ testset = torchvision.datasets.MNIST(root = './data', train = False, download = 
 trainloader = torch.utils.data.DataLoader(trainset, batch_size = 64, shuffle= True)
 testloader = torch.utils.data.DataLoader(testset, batch_size = 64, shuffle = False)
 
-# CNN模型
-class Net(nn.Module):
+# 兩層卷積的MSE + LASSO 回歸風格CNN模型
+class TwoLayerMSELassoCNN(nn.Module):
     def __init__(self):
-        super(Net, self).__init__()
-        self.conv1 = nn.Conv2d(1, 32, kernel_size = 3, padding = 1) # input 1 -> output 32
-        self.conv2 = nn.Conv2d(32, 64, kernel_size = 3, padding = 1) # input 32 -> output 64
-        self.fc1 = nn.Linear(7*7*64, 128)
-        self.fc2 = nn.Linear(128, 10)
-
+        super(TwoLayerMSELassoCNN, self).__init__()
+        # 第一層: 32個濾波器 (應用LASSO)
+        self.conv1 = nn.Conv2d(1, 32, kernel_size=3, padding=1)
+        # 第二層: 64個濾波器 (標準訓練)
+        self.conv2 = nn.Conv2d(32, 64, kernel_size=3, padding=1)
+        # 全局池化
+        self.global_pool = nn.AdaptiveAvgPool2d((1, 1))
+        # 全連接層
+        self.fc = nn.Linear(64, 10)
+        
+        # 統計追踪
+        self.conv1_weight_history = []
+        self.conv2_weight_history = []
+        self.conv1_sparsity_history = []
+        
     def forward(self, x):
-        # 卷積 + 激活 + 池化
-        x = torch.relu(self.conv1(x))
-        x = torch.max_pool2d(x, 2)
-        x = torch.relu(self.conv2(x))
-        x = torch.max_pool2d(x, 2)
+        # 第一層卷積 + ReLU + 池化
+        x = torch.relu(self.conv1(x))      # [batch, 32, 28, 28]
+        x = torch.max_pool2d(x, 2)         # [batch, 32, 14, 14]
+        
+        # 第二層卷積 + ReLU + 池化  
+        x = torch.relu(self.conv2(x))      # [batch, 64, 14, 14]
+        x = torch.max_pool2d(x, 2)         # [batch, 64, 7, 7]
+        
+        # 全局平均池化 + 全連接層
+        x = self.global_pool(x)            # [batch, 64, 1, 1]
+        x = x.view(x.size(0), -1)          # [batch, 64]
+        x = self.fc(x)                     # [batch, 10]
+        
+        # 記錄權重統計
+        with torch.no_grad():
+            self.conv1_weight_history.append(self.conv1.weight.data.clone().cpu().numpy())
+            self.conv2_weight_history.append(self.conv2.weight.data.clone().cpu().numpy())
+            conv1_sparsity = (self.conv1.weight.data == 0).float().mean()
+            self.conv1_sparsity_history.append(conv1_sparsity.cpu().numpy())
+        
+        return x  # 輸出10維響應向量
 
-        # 轉換為1維
-        x = x.view(-1, 7*7*64)
-        x = torch.relu(self.fc1(x))
-        x = self.fc2(x)
+# 將標籤轉換為one-hot編碼 (回歸目標)
+def labels_to_onehot(labels, num_classes=10):
+    return torch.eye(num_classes)[labels]
 
-        return x
+# 計算測試集準確率
+def calculate_accuracy(model, testloader):
+    """計算分類準確率"""
+    model.eval()
+    correct = 0
+    total = 0
+    
+    with torch.no_grad():
+        for images, labels in testloader:
+            outputs = model(images)
+            
+            # 方法1: 取輸出最大值的索引作為預測類別
+            _, predicted = torch.max(outputs.data, 1)
+            
+            # 方法2: 也可以使用軟最大值後取最大概率
+            # probabilities = F.softmax(outputs, dim=1)
+            # _, predicted = torch.max(probabilities, 1)
+            
+            total += labels.size(0)
+            correct += (predicted == labels).sum().item()
+    
+    accuracy = 100 * correct / total
+    return accuracy, correct, total
 
-# 顯示conv1的全部32個濾波器矩陣
-def print_all_conv1_filters(model, epoch=None):
-    # 獲取conv1的權重
+# 顯示conv1和conv2的濾波器分析
+def print_all_filters(model, epoch=None, test_accuracy=None):
     conv1_weight = model.conv1.weight.data.cpu().numpy()  # [32, 1, 3, 3]
-    conv1_bias = model.conv1.bias.data.cpu().numpy() if model.conv1.bias is not None else None
+    conv2_weight = model.conv2.weight.data.cpu().numpy()  # [64, 32, 3, 3]
     
     print(f"\n{'='*100}")
-    print(f"CONV1 全部 32 個濾波器矩陣 (Epoch {epoch if epoch else '初始'})")
+    print(f"兩層MSE+LASSO CNN濾波器分析 (Epoch {epoch if epoch else '初始'})")
     print(f"{'='*100}")
-    print(f"權重張量形狀: {conv1_weight.shape}")
-    print(f"每個濾波器形狀: 3x3")
-    print(f"權重範圍: [{conv1_weight.min():.8f}, {conv1_weight.max():.8f}]")
-    print(f"權重絕對值平均: {np.abs(conv1_weight).mean():.8f}")
-    print(f"零權重比例: {(conv1_weight == 0).mean():.4%}")
+    print(f"優化目標: min ‖y_onehot - f(X;W)‖² + λ‖W_conv1‖₁")
     
-    if conv1_bias is not None:
-        print(f"偏置向量: {conv1_bias}")
+    if test_accuracy is not None:
+        print(f"測試集準確率: {test_accuracy:.2f}%")
     
-    print(f"\n{'#'*100}")
-    print(f"開始輸出 32 個濾波器的完整 3x3 矩陣:")
-    print(f"{'#'*100}")
+    # Conv1 分析
+    print(f"\n第一層 (Conv1) - LASSO正則化:")
+    print(f"  濾波器數量: 32")
+    print(f"  權重形狀: {conv1_weight.shape}")
+    print(f"  權重範圍: [{conv1_weight.min():.8f}, {conv1_weight.max():.8f}]")
+    print(f"  零權重比例: {(conv1_weight == 0).mean():.4%}")
+    print(f"  權重絕對值平均: {np.abs(conv1_weight).mean():.8f}")
     
-    # 輸出所有32個濾波器的完整矩陣
-    for filter_idx in range(32):
-        print(f"\n{'─'*80}")
-        print(f"濾波器 #{filter_idx:2d}:")
-        print(f"{'─'*80}")
-        
-        # 獲取當前濾波器的 3x3 權重矩陣
-        filter_matrix = conv1_weight[filter_idx, 0]  # [3, 3]
-        
-        print("完整 3x3 權重矩陣:")
-        print("┌                         ┐")
-        for i in range(3):
-            print("│", end="")
-            for j in range(3):
-                print(f" {filter_matrix[i, j]:12.8f} ", end="")
-            print("│")
-        print("└                         ┘")
-        
-        # 詳細統計資訊
-        print(f"\n濾波器 #{filter_idx:2d} 的詳細統計:")
-        print(f"  ┌ 最小值: {filter_matrix.min():12.8f}")
-        print(f"  ├ 最大值: {filter_matrix.max():12.8f}")
-        print(f"  ├ 平均值: {filter_matrix.mean():12.8f}")
-        print(f"  ├ 標準差: {filter_matrix.std():12.8f}")
-        print(f"  ├ 絕對值平均: {np.abs(filter_matrix).mean():12.8f}")
-        print(f"  ├ L1範數: {np.abs(filter_matrix).sum():12.8f}")
-        print(f"  ├ L2範數: {np.sqrt((filter_matrix**2).sum()):12.8f}")
-        print(f"  └ 零值數量: {np.sum(filter_matrix == 0):2d}/9")
-        
-        if conv1_bias is not None:
-            print(f"  └ 偏置項: {conv1_bias[filter_idx]:12.8f}")
+    # Conv2 分析
+    print(f"\n第二層 (Conv2) - 標準訓練:")
+    print(f"  濾波器數量: 64") 
+    print(f"  權重形狀: {conv2_weight.shape}")
+    print(f"  權重範圍: [{conv2_weight.min():.8f}, {conv2_weight.max():.8f}]")
+    print(f"  零權重比例: {(conv2_weight == 0).mean():.4%}")
+    print(f"  權重絕對值平均: {np.abs(conv2_weight).mean():.8f}")
     
-    print(f"\n{'#'*100}")
-    print(f"32 個濾波器匯總統計:")
-    print(f"{'#'*100}")
-    
-    # 匯總統計
-    all_weights = conv1_weight.flatten()
-    print(f"總權重數量: {len(all_weights)}")
-    print(f"全域統計:")
-    print(f"  ┌ 最小值: {all_weights.min():12.8f}")
-    print(f"  ├ 最大值: {all_weights.max():12.8f}") 
-    print(f"  ├ 平均值: {all_weights.mean():12.8f}")
-    print(f"  ├ 中位數: {np.median(all_weights):12.8f}")
-    print(f"  ├ 標準差: {all_weights.std():12.8f}")
-    print(f"  └ 零值比例: {(all_weights == 0).mean():8.4%}")
-    
-    # 保存完整數據到文件
-    save_complete_filters_to_file(conv1_weight, conv1_bias, epoch)
+    return conv1_weight, conv2_weight
 
-# 保存完整濾波器數據到文件
-def save_complete_filters_to_file(weights, bias, epoch=None):
-    if epoch is not None:
-        filename = f"conv1_all_filters_epoch{epoch}.txt"
-        npz_filename = f"conv1_all_filters_epoch{epoch}.npz"
-    else:
-        filename = "conv1_all_filters_initial.txt"
-        npz_filename = "conv1_all_filters_initial.npz"
-    
-    # 保存為詳細文本文件
-    with open(filename, 'w', encoding='utf-8') as f:
-        f.write(f"CONV1 全部 32 個濾波器完整數據 (Epoch {epoch if epoch else 'initial'})\n")
-        f.write("="*120 + "\n")
-        f.write(f"權重張量形狀: {weights.shape}\n")
-        f.write(f"權重範圍: [{weights.min():.8f}, {weights.max():.8f}]\n")
-        f.write(f"權重絕對值平均: {np.abs(weights).mean():.8f}\n")
-        f.write(f"零權重比例: {(weights == 0).mean():.4%}\n\n")
-        
-        if bias is not None:
-            f.write("偏置向量:\n")
-            for i, b in enumerate(bias):
-                f.write(f"  Filter {i:2d}: {b:12.8f}\n")
-            f.write("\n")
-        
-        f.write("各濾波器詳細數據:\n")
-        f.write("="*120 + "\n")
-        
-        for filter_idx in range(32):
-            f.write(f"\n濾波器 #{filter_idx:2d}:\n")
-            f.write("-"*80 + "\n")
-            
-            filter_matrix = weights[filter_idx, 0]
-            
-            f.write("3x3 權重矩陣:\n")
-            f.write("┌                         ┐\n")
-            for i in range(3):
-                f.write("│")
-                for j in range(3):
-                    f.write(f" {filter_matrix[i, j]:12.8f} ")
-                f.write("│\n")
-            f.write("└                         ┘\n")
-            
-            f.write(f"統計資訊:\n")
-            f.write(f"  最小值: {filter_matrix.min():12.8f}\n")
-            f.write(f"  最大值: {filter_matrix.max():12.8f}\n")
-            f.write(f"  平均值: {filter_matrix.mean():12.8f}\n")
-            f.write(f"  標準差: {filter_matrix.std():12.8f}\n")
-            f.write(f"  絕對值平均: {np.abs(filter_matrix).mean():12.8f}\n")
-            f.write(f"  L1範數: {np.abs(filter_matrix).sum():12.8f}\n")
-            f.write(f"  L2範數: {np.sqrt((filter_matrix**2).sum()):12.8f}\n")
-            f.write(f"  零值數量: {np.sum(filter_matrix == 0):2d}/9\n")
-            
-            if bias is not None:
-                f.write(f"  偏置項: {bias[filter_idx]:12.8f}\n")
-            
-            f.write("\n")
-    
-    # 保存為numpy文件
-    if bias is not None:
-        np.savez(npz_filename, 
-                filters=weights,
-                bias=bias,
-                filter_stats={
-                    'min': weights.min(),
-                    'max': weights.max(), 
-                    'mean': weights.mean(),
-                    'std': weights.std(),
-                    'zero_ratio': (weights == 0).mean()
-                })
-    else:
-        np.savez(npz_filename, 
-                filters=weights,
-                filter_stats={
-                    'min': weights.min(),
-                    'max': weights.max(),
-                    'mean': weights.mean(), 
-                    'std': weights.std(),
-                    'zero_ratio': (weights == 0).mean()
-                })
-    
-    print(f"\n完整濾波器數據已保存到:")
-    print(f"  - 文本文件: {filename}")
-    print(f"  - NumPy文件: {npz_filename}")
-
-# 可視化所有濾波器
+# 可視化濾波器
 def visualize_all_filters(model, epoch=None):
     conv1_weight = model.conv1.weight.data.cpu().numpy()
+    conv2_weight = model.conv2.weight.data.cpu().numpy()
     
-    # 創建 4x8 的子圖來顯示所有32個濾波器
-    fig, axes = plt.subplots(4, 8, figsize=(20, 10))
-    fig.suptitle(f'CONV1 all 32 channel visualization (Epoch {epoch if epoch else "初始"})', fontsize=16, y=0.95)
+    # 創建兩個子圖
+    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(20, 8))
+    fig.suptitle(f'兩層CNN濾波器可視化 (Epoch {epoch if epoch else "初始"})', fontsize=16, y=0.95)
     
-    # 計算統一的顏色範圍
-    vmax = max(np.abs(conv1_weight.min()), np.abs(conv1_weight.max()))
-    vmin = -vmax
+    # Conv1 可視化 (顯示前16個濾波器)
+    vmax1 = max(np.abs(conv1_weight.min()), np.abs(conv1_weight.max()))
+    vmin1 = -vmax1
     
-    for i, ax in enumerate(axes.flat):
+    # 創建4x4的子圖來顯示前16個conv1濾波器
+    for i in range(16):
         if i < 32:
+            ax = plt.subplot(4, 4, i+1)
             weights = conv1_weight[i, 0]
-            im = ax.imshow(weights, cmap='RdBu', vmin=vmin, vmax=vmax)
-            ax.set_title(f'Filter {i}', fontsize=10, pad=5)
-            ax.set_xticks([0, 1, 2])
-            ax.set_yticks([0, 1, 2])
-            ax.grid(False)
-            
-            # 在每個格子上顯示數值
-            for row in range(3):
-                for col in range(3):
-                    value = weights[row, col]
-                    color = "black" if abs(value) < vmax * 0.5 else "white"
-                    text = ax.text(col, row, f'{value:.3f}',
-                                 ha="center", va="center", color=color, 
-                                 fontsize=8, fontweight='bold')
-        
-        else:
-            ax.axis('off')
+            im = ax.imshow(weights, cmap='RdBu', vmin=vmin1, vmax=vmax1)
+            ax.set_title(f'Conv1-{i}', fontsize=8, pad=2)
+            ax.set_xticks([])
+            ax.set_yticks([])
     
-    # 添加顏色條
-    cbar = fig.colorbar(im, ax=axes, shrink=0.8, pad=0.02)
-    cbar.set_label('weight', rotation=270, labelpad=15)
+    plt.colorbar(im, ax=ax1, shrink=0.8)
+    ax1.axis('off')
+    ax1.set_title('第一層 Conv1 濾波器 (LASSO)', fontsize=12, pad=10)
+    
+    # Conv2 可視化 (顯示前16個濾波器的第一個輸入通道)
+    vmax2 = max(np.abs(conv2_weight.min()), np.abs(conv2_weight.max()))
+    vmin2 = -vmax2
+    
+    for i in range(16):
+        if i < 64:
+            ax = plt.subplot(4, 4, i+1)
+            weights = conv2_weight[i, 0]  # 取第一個輸入通道
+            im = ax.imshow(weights, cmap='RdBu', vmin=vmin2, vmax=vmax2)
+            ax.set_title(f'Conv2-{i}', fontsize=8, pad=2)
+            ax.set_xticks([])
+            ax.set_yticks([])
+    
+    plt.colorbar(im, ax=ax2, shrink=0.8)
+    ax2.axis('off')
+    ax2.set_title('第二層 Conv2 濾波器 (標準)', fontsize=12, pad=10)
     
     plt.tight_layout()
-    plt.subplots_adjust(top=0.90)
+    plt.subplots_adjust(top=0.85)
     plt.show()
 
-# 真實Lasso參數
-lambda_l1 = 1e-5          # L1 強度
-lr_conv1  = 0.01          # conv1 的學習率
+# 分析回歸性能和分類準確率
+def analyze_model_performance(model, testloader, epoch=None):
+    """分析回歸性能和分類準確率"""
+    model.eval()
+    all_predictions = []
+    all_targets = []
+    all_labels = []
+    
+    with torch.no_grad():
+        for images, labels in testloader:
+            targets = labels_to_onehot(labels)
+            predictions = model(images)
+            
+            all_predictions.append(predictions.cpu().numpy())
+            all_targets.append(targets.cpu().numpy())
+            all_labels.append(labels.cpu().numpy())
+    
+    all_predictions = np.concatenate(all_predictions)
+    all_targets = np.concatenate(all_targets)
+    all_labels = np.concatenate(all_labels)
+    
+    # 計算回歸指標
+    total_mse = np.mean((all_predictions - all_targets) ** 2)
+    
+    # 計算R²
+    ss_total = np.var(all_targets) * all_targets.shape[0]
+    ss_residual = np.sum((all_targets - all_predictions) ** 2)
+    r_squared = 1 - (ss_residual / ss_total)
+    
+    # 計算分類準確率
+    predicted_classes = np.argmax(all_predictions, axis=1)
+    accuracy = np.mean(predicted_classes == all_labels) * 100
+    
+    # 計算各類別MSE和準確率
+    mse_per_class = []
+    accuracy_per_class = []
+    
+    for i in range(10):
+        class_mask = (all_labels == i)
+        if np.sum(class_mask) > 0:
+            class_mse = np.mean((all_predictions[class_mask, i] - all_targets[class_mask, i]) ** 2)
+            class_accuracy = np.mean(predicted_classes[class_mask] == all_labels[class_mask]) * 100
+        else:
+            class_mse = 0
+            class_accuracy = 0
+        
+        mse_per_class.append(class_mse)
+        accuracy_per_class.append(class_accuracy)
+    
+    print(f"\n{'#'*80}")
+    print(f"模型性能分析 (Epoch {epoch if epoch else '初始'})")
+    print(f"{'#'*80}")
+    print(f"回歸性能:")
+    print(f"  總均方誤差 (MSE): {total_mse:.6f}")
+    print(f"  決定係數 (R²): {r_squared:.6f}")
+    print(f"  平均絕對誤差 (MAE): {np.mean(np.abs(all_predictions - all_targets)):.6f}")
+    
+    print(f"\n分類性能:")
+    print(f"  測試集準確率: {accuracy:.2f}%")
+    print(f"  正確預測: {np.sum(predicted_classes == all_labels)} / {len(all_labels)}")
+    
+    print(f"\n各數字類別性能:")
+    for i in range(10):
+        print(f"  數字 {i}: MSE={mse_per_class[i]:.6f}, 準確率={accuracy_per_class[i]:.2f}%")
+    
+    return total_mse, r_squared, accuracy, all_predictions, all_targets, all_labels
 
-model = Net()
-criterion = nn.CrossEntropyLoss()
-
-print("初始 CONV1 全部 32 個濾波器:")
-print_all_conv1_filters(model, "初始")
-visualize_all_filters(model, "初始")
-
-# 只訓練 conv2、fc1、fc2 用 SGD；conv1 由我們手動做 Lasso 近端步驟
-other_params = [p for n, p in model.named_parameters() if not n.startswith('conv1.')]
-optimizer = optim.SGD(other_params, lr=0.01, momentum=0.9)
-
+# 軟閾值函數 (LASSO近端算子)
 def soft_threshold(w, thr):
     return torch.sign(w) * torch.clamp(w.abs() - thr, min=0.0)
 
-# ---- 訓練並定期顯示所有conv1濾波器 ----
-for epoch in range(5):
-    model.train()
-    running_loss = 0.0
-    for i, (inputs, labels) in enumerate(trainloader):
-        optimizer.zero_grad()
-
-        outputs = model(inputs)
-        ce = criterion(outputs, labels)
-        ce.backward()
-
-        # 1) 先更新「非 conv1」參數（SGD）
-        optimizer.step()
-
-        # 2) 對 conv1 做一次「梯度步 + 近端軟閾值」
-        with torch.no_grad():
-            model.conv1.weight -= lr_conv1 * model.conv1.weight.grad
-            if model.conv1.bias is not None:
-                model.conv1.bias   -= lr_conv1 * model.conv1.bias.grad
-
-            model.conv1.weight.copy_(soft_threshold(model.conv1.weight, lr_conv1 * lambda_l1))
-
-            model.conv1.weight.grad.zero_()
-            if model.conv1.bias is not None:
-                model.conv1.bias.grad.zero_()
-
-        running_loss += ce.item()
-        if i % 100 == 99:
-            print(f"[Epoch {epoch+1}, Batch {i+1}] loss: {running_loss/100:.3f}")
-            running_loss = 0.0
+# 主訓練函數
+def train_two_layer_mse_lasso():
+    print("="*80)
+    print("兩層MSE + LASSO CNN回歸訓練 (含準確率計算)")
+    print("優化目標: min ‖y_onehot - f(X;W)‖² + λ‖W_conv1‖₁")
+    print("="*80)
     
-    # 每個epoch結束後顯示所有conv1濾波器
+    # 初始化模型
+    model = TwoLayerMSELassoCNN()
+    
+    # 使用MSE損失函數
+    criterion = nn.MSELoss()
+    
+    # LASSO參數 (只應用於conv1)
+    lambda_l1 = 1e-4          # L1 正則化強度
+    lr_conv1 = 0.01           # conv1 的學習率
+    
+    print("初始模型分析:")
+    initial_accuracy, _, _ = calculate_accuracy(model, testloader)
+    initial_conv1, initial_conv2 = print_all_filters(model, "初始", initial_accuracy)
+    visualize_all_filters(model, "初始")
+    
+    # 初始性能分析
+    initial_mse, initial_r2, initial_accuracy, _, _, _ = analyze_model_performance(model, testloader, "初始")
+    
+    # 優化器設置: 只對非conv1參數使用標準SGD, conv1手動更新
+    other_params = [p for n, p in model.named_parameters() if not n.startswith('conv1.')]
+    optimizer = optim.SGD(other_params, lr=0.01, momentum=0.9)
+    
+    # 儲存訓練歷史
+    train_history = {
+        'epoch': [],
+        'train_loss': [],
+        'test_accuracy': [],
+        'test_mse': [],
+        'conv1_sparsity': []
+    }
+    
+    # ---- 訓練循環 ----
+    for epoch in range(50):
+        model.train()
+        running_loss = 0.0
+        mse_loss_total = 0.0
+        l1_penalty_total = 0.0
+        
+        for i, (inputs, labels) in enumerate(trainloader):
+            # 將標籤轉換為one-hot編碼
+            targets = labels_to_onehot(labels)
+            
+            # 前向傳播
+            outputs = model(inputs)
+            
+            # 計算MSE損失
+            mse_loss = criterion(outputs, targets.float())
+            
+            # 計算L1懲罰項 (只對conv1)
+            l1_penalty = lambda_l1 * torch.norm(model.conv1.weight, p=1)
+            
+            # 總損失 = MSE + L1
+            total_loss = mse_loss + l1_penalty
+            
+            # 反向傳播
+            optimizer.zero_grad()
+            total_loss.backward()
+            
+            # 1) 更新非conv1參數 (conv2和fc)
+            optimizer.step()
+            
+            # 2) 對conv1做「梯度步 + 近端軟閾值」- LASSO更新
+            with torch.no_grad():
+                if model.conv1.weight.grad is not None:
+                    model.conv1.weight -= lr_conv1 * model.conv1.weight.grad
+                    # LASSO近端算子
+                    model.conv1.weight.copy_(soft_threshold(model.conv1.weight, lr_conv1 * lambda_l1))
+                    model.conv1.weight.grad.zero_()
+            
+            running_loss += total_loss.item()
+            mse_loss_total += mse_loss.item()
+            l1_penalty_total += l1_penalty.item()
+            
+            if i % 100 == 99:
+                avg_loss = running_loss / 100
+                avg_mse = mse_loss_total / 100
+                avg_l1 = l1_penalty_total / 100
+                current_sparsity = (model.conv1.weight == 0).float().mean().item()
+                
+                print(f"[Epoch {epoch+1}, Batch {i+1}] "
+                      f"Loss: {avg_loss:.4f} (MSE: {avg_mse:.4f}, L1: {avg_l1:.6f}) "
+                      f"Conv1稀疏性: {current_sparsity:.4%}")
+                running_loss = 0.0
+                mse_loss_total = 0.0
+                l1_penalty_total = 0.0
+        
+        # 每個epoch結束後計算測試集準確率
+        test_accuracy, correct, total = calculate_accuracy(model, testloader)
+        current_mse, current_r2, current_accuracy, _, _, _ = analyze_model_performance(model, testloader, epoch+1)
+        
+        # 記錄訓練歷史
+        train_history['epoch'].append(epoch+1)
+        train_history['train_loss'].append(avg_loss if 'avg_loss' in locals() else running_loss)
+        train_history['test_accuracy'].append(test_accuracy)
+        train_history['test_mse'].append(current_mse)
+        train_history['conv1_sparsity'].append((model.conv1.weight == 0).float().mean().item())
+        
+        # 每個epoch結束後的分析
+        print(f"\n{'#'*100}")
+        print(f"Epoch {epoch+1} 結束 - 兩層MSE+LASSO分析")
+        print(f"{'#'*100}")
+        
+        current_conv1, current_conv2 = print_all_filters(model, epoch+1, test_accuracy)
+        visualize_all_filters(model, epoch+1)
+        
+        # 計算權重變化
+        conv1_weight_change = np.mean(np.abs(current_conv1 - initial_conv1))
+        print(f"Conv1權重平均變化: {conv1_weight_change:.6f}")
+        print(f"Conv1稀疏性: {(current_conv1 == 0).mean():.4%}")
+        print(f"測試集準確率: {test_accuracy:.2f}%")
+    
+    print("兩層MSE+LASSO回歸訓練完成")
+    
+    # 最終分析
     print(f"\n{'#'*100}")
-    print(f"Epoch {epoch+1} 結束 - CONV1 全部濾波器")
+    print(f"最終模型分析")
     print(f"{'#'*100}")
-    print_all_conv1_filters(model, epoch+1)
-    visualize_all_filters(model, epoch+1)
+    final_accuracy, final_correct, final_total = calculate_accuracy(model, testloader)
+    final_conv1, final_conv2 = print_all_filters(model, "最終", final_accuracy)
+    visualize_all_filters(model, "最終")
+    final_mse, final_r2, final_accuracy, final_predictions, final_targets, final_labels = analyze_model_performance(model, testloader, "最終")
+    
+    # 訓練過程總結
+    print(f"\n{'#'*80}")
+    print("訓練過程總結")
+    print(f"{'#'*80}")
+    print(f"初始 MSE: {initial_mse:.6f}")
+    print(f"最終 MSE: {final_mse:.6f}")
+    print(f"MSE改善: {initial_mse - final_mse:.6f}")
+    print(f"最終 R²: {final_r2:.6f}")
+    print(f"初始準確率: {initial_accuracy:.2f}%")
+    print(f"最終準確率: {final_accuracy:.2f}%")
+    print(f"準確率提升: {final_accuracy - initial_accuracy:.2f}%")
+    
+    # 稀疏性分析
+    final_conv1_sparsity = (final_conv1 == 0).mean()
+    final_conv2_sparsity = (final_conv2 == 0).mean()
+    print(f"Conv1最終稀疏性: {final_conv1_sparsity:.4%}")
+    print(f"Conv2最終稀疏性: {final_conv2_sparsity:.4%}")
+    print(f"Conv1非零參數: {np.sum(final_conv1 != 0)} / {final_conv1.size}")
+    print(f"Conv2非零參數: {np.sum(final_conv2 != 0)} / {final_conv2.size}")
+    
+    return model, final_conv1, final_conv2, final_mse, final_r2, final_accuracy, train_history
 
-print("訓練完成")
+# 繪製訓練歷史
+def plot_training_history(history):
+    """繪製訓練過程的歷史曲線"""
+    fig, ((ax1, ax2), (ax3, ax4)) = plt.subplots(2, 2, figsize=(15, 10))
+    
+    # 訓練損失
+    ax1.plot(history['epoch'], history['train_loss'], 'b-', linewidth=2, marker='o')
+    ax1.set_xlabel('Epoch')
+    ax1.set_ylabel('Training Loss')
+    ax1.set_title('訓練損失')
+    ax1.grid(True, alpha=0.3)
+    
+    # 測試集準確率
+    ax2.plot(history['epoch'], history['test_accuracy'], 'g-', linewidth=2, marker='s')
+    ax2.set_xlabel('Epoch')
+    ax2.set_ylabel('Test Accuracy (%)')
+    ax2.set_title('測試集準確率')
+    ax2.grid(True, alpha=0.3)
+    
+    # 測試集MSE
+    ax3.plot(history['epoch'], history['test_mse'], 'r-', linewidth=2, marker='^')
+    ax3.set_xlabel('Epoch')
+    ax3.set_ylabel('Test MSE')
+    ax3.set_title('測試集MSE')
+    ax3.grid(True, alpha=0.3)
+    
+    # Conv1稀疏性
+    ax4.plot(history['epoch'], [s*100 for s in history['conv1_sparsity']], 'm-', linewidth=2, marker='d')
+    ax4.set_xlabel('Epoch')
+    ax4.set_ylabel('Conv1 Sparsity (%)')
+    ax4.set_title('Conv1層稀疏性')
+    ax4.grid(True, alpha=0.3)
+    
+    plt.tight_layout()
+    plt.suptitle('MSE+LASSO訓練過程分析', y=1.02, fontsize=16)
+    plt.show()
 
-# ---- 評估準確度 ----
-model.eval()
-correct, total = 0, 0
-with torch.no_grad():
-    for images, labels in testloader:
-        outputs = model(images)
-        pred = outputs.argmax(dim=1)
-        total += labels.size(0)
-        correct += (pred == labels).sum().item()
-print(f"測試集準確率: {100*correct/total:.2f}%")
-
-# 最終conv1所有濾波器顯示
-print(f"\n{'#'*100}")
-print(f"最終模型 CONV1 全部 32 個濾波器")
-print(f"{'#'*100}")
-print_all_conv1_filters(model, "最終")
-visualize_all_filters(model, "最終")
+# 執行訓練
+if __name__ == "__main__":
+    model, final_conv1, final_conv2, final_mse, final_r2, final_accuracy, history = train_two_layer_mse_lasso()
+    
+    # 繪製訓練歷史
+    plot_training_history(history)
+    
+    print(f"\n{'='*80}")
+    print("訓練完成總結:")
+    print(f"最終測試集準確率: {final_accuracy:.2f}%")
+    print(f"最終測試集MSE: {final_mse:.6f}")
+    print(f"最終R²: {final_r2:.6f}")
+    print(f"Conv1稀疏性: {(final_conv1 == 0).mean():.4%}")
+    print(f"{'='*80}")
