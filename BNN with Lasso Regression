@@ -1,0 +1,314 @@
+import torch
+import torch.nn as nn
+import torch.optim as optim
+import torchvision
+import torchvision.transforms as transforms
+import matplotlib.pyplot as plt
+import numpy as np
+
+# 定義數據轉換
+transform = transforms.Compose([transforms.ToTensor(), transforms.Normalize((0.5, ), (0.5, ))])
+
+# 下載數據和訓練數據
+trainset = torchvision.datasets.MNIST(root = './data', train = True, download = True, transform = transform)
+testset = torchvision.datasets.MNIST(root = './data', train = False, download = True, transform = transform)
+
+# 使用DataLoader來分割數據集
+trainloader = torch.utils.data.DataLoader(trainset, batch_size = 64, shuffle= True)
+testloader = torch.utils.data.DataLoader(testset, batch_size = 64, shuffle = False)
+
+# CNN模型
+class Net(nn.Module):
+    def __init__(self):
+        super(Net, self).__init__()
+        self.conv1 = nn.Conv2d(1, 32, kernel_size = 3, padding = 1) # input 1 -> output 32
+        self.conv2 = nn.Conv2d(32, 64, kernel_size = 3, padding = 1) # input 32 -> output 64
+        self.fc1 = nn.Linear(7*7*64, 128)
+        self.fc2 = nn.Linear(128, 10)
+
+    def forward(self, x):
+        # 卷積 + 激活 + 池化
+        x = torch.relu(self.conv1(x))
+        x = torch.max_pool2d(x, 2)
+        x = torch.relu(self.conv2(x))
+        x = torch.max_pool2d(x, 2)
+
+        # 轉換為1維
+        x = x.view(-1, 7*7*64)
+        x = torch.relu(self.fc1(x))
+        x = self.fc2(x)
+
+        return x
+
+# 顯示conv1的全部32個濾波器矩陣
+def print_all_conv1_filters(model, epoch=None):
+    # 獲取conv1的權重
+    conv1_weight = model.conv1.weight.data.cpu().numpy()  # [32, 1, 3, 3]
+    conv1_bias = model.conv1.bias.data.cpu().numpy() if model.conv1.bias is not None else None
+    
+    print(f"\n{'='*100}")
+    print(f"CONV1 全部 32 個濾波器矩陣 (Epoch {epoch if epoch else '初始'})")
+    print(f"{'='*100}")
+    print(f"權重張量形狀: {conv1_weight.shape}")
+    print(f"每個濾波器形狀: 3x3")
+    print(f"權重範圍: [{conv1_weight.min():.8f}, {conv1_weight.max():.8f}]")
+    print(f"權重絕對值平均: {np.abs(conv1_weight).mean():.8f}")
+    print(f"零權重比例: {(conv1_weight == 0).mean():.4%}")
+    
+    if conv1_bias is not None:
+        print(f"偏置向量: {conv1_bias}")
+    
+    print(f"\n{'#'*100}")
+    print(f"開始輸出 32 個濾波器的完整 3x3 矩陣:")
+    print(f"{'#'*100}")
+    
+    # 輸出所有32個濾波器的完整矩陣
+    for filter_idx in range(32):
+        print(f"\n{'─'*80}")
+        print(f"濾波器 #{filter_idx:2d}:")
+        print(f"{'─'*80}")
+        
+        # 獲取當前濾波器的 3x3 權重矩陣
+        filter_matrix = conv1_weight[filter_idx, 0]  # [3, 3]
+        
+        print("完整 3x3 權重矩陣:")
+        print("┌                         ┐")
+        for i in range(3):
+            print("│", end="")
+            for j in range(3):
+                print(f" {filter_matrix[i, j]:12.8f} ", end="")
+            print("│")
+        print("└                         ┘")
+        
+        # 詳細統計資訊
+        print(f"\n濾波器 #{filter_idx:2d} 的詳細統計:")
+        print(f"  ┌ 最小值: {filter_matrix.min():12.8f}")
+        print(f"  ├ 最大值: {filter_matrix.max():12.8f}")
+        print(f"  ├ 平均值: {filter_matrix.mean():12.8f}")
+        print(f"  ├ 標準差: {filter_matrix.std():12.8f}")
+        print(f"  ├ 絕對值平均: {np.abs(filter_matrix).mean():12.8f}")
+        print(f"  ├ L1範數: {np.abs(filter_matrix).sum():12.8f}")
+        print(f"  ├ L2範數: {np.sqrt((filter_matrix**2).sum()):12.8f}")
+        print(f"  └ 零值數量: {np.sum(filter_matrix == 0):2d}/9")
+        
+        if conv1_bias is not None:
+            print(f"  └ 偏置項: {conv1_bias[filter_idx]:12.8f}")
+    
+    print(f"\n{'#'*100}")
+    print(f"32 個濾波器匯總統計:")
+    print(f"{'#'*100}")
+    
+    # 匯總統計
+    all_weights = conv1_weight.flatten()
+    print(f"總權重數量: {len(all_weights)}")
+    print(f"全域統計:")
+    print(f"  ┌ 最小值: {all_weights.min():12.8f}")
+    print(f"  ├ 最大值: {all_weights.max():12.8f}") 
+    print(f"  ├ 平均值: {all_weights.mean():12.8f}")
+    print(f"  ├ 中位數: {np.median(all_weights):12.8f}")
+    print(f"  ├ 標準差: {all_weights.std():12.8f}")
+    print(f"  └ 零值比例: {(all_weights == 0).mean():8.4%}")
+    
+    # 保存完整數據到文件
+    save_complete_filters_to_file(conv1_weight, conv1_bias, epoch)
+
+# 保存完整濾波器數據到文件
+def save_complete_filters_to_file(weights, bias, epoch=None):
+    if epoch is not None:
+        filename = f"conv1_all_filters_epoch{epoch}.txt"
+        npz_filename = f"conv1_all_filters_epoch{epoch}.npz"
+    else:
+        filename = "conv1_all_filters_initial.txt"
+        npz_filename = "conv1_all_filters_initial.npz"
+    
+    # 保存為詳細文本文件
+    with open(filename, 'w', encoding='utf-8') as f:
+        f.write(f"CONV1 全部 32 個濾波器完整數據 (Epoch {epoch if epoch else 'initial'})\n")
+        f.write("="*120 + "\n")
+        f.write(f"權重張量形狀: {weights.shape}\n")
+        f.write(f"權重範圍: [{weights.min():.8f}, {weights.max():.8f}]\n")
+        f.write(f"權重絕對值平均: {np.abs(weights).mean():.8f}\n")
+        f.write(f"零權重比例: {(weights == 0).mean():.4%}\n\n")
+        
+        if bias is not None:
+            f.write("偏置向量:\n")
+            for i, b in enumerate(bias):
+                f.write(f"  Filter {i:2d}: {b:12.8f}\n")
+            f.write("\n")
+        
+        f.write("各濾波器詳細數據:\n")
+        f.write("="*120 + "\n")
+        
+        for filter_idx in range(32):
+            f.write(f"\n濾波器 #{filter_idx:2d}:\n")
+            f.write("-"*80 + "\n")
+            
+            filter_matrix = weights[filter_idx, 0]
+            
+            f.write("3x3 權重矩陣:\n")
+            f.write("┌                         ┐\n")
+            for i in range(3):
+                f.write("│")
+                for j in range(3):
+                    f.write(f" {filter_matrix[i, j]:12.8f} ")
+                f.write("│\n")
+            f.write("└                         ┘\n")
+            
+            f.write(f"統計資訊:\n")
+            f.write(f"  最小值: {filter_matrix.min():12.8f}\n")
+            f.write(f"  最大值: {filter_matrix.max():12.8f}\n")
+            f.write(f"  平均值: {filter_matrix.mean():12.8f}\n")
+            f.write(f"  標準差: {filter_matrix.std():12.8f}\n")
+            f.write(f"  絕對值平均: {np.abs(filter_matrix).mean():12.8f}\n")
+            f.write(f"  L1範數: {np.abs(filter_matrix).sum():12.8f}\n")
+            f.write(f"  L2範數: {np.sqrt((filter_matrix**2).sum()):12.8f}\n")
+            f.write(f"  零值數量: {np.sum(filter_matrix == 0):2d}/9\n")
+            
+            if bias is not None:
+                f.write(f"  偏置項: {bias[filter_idx]:12.8f}\n")
+            
+            f.write("\n")
+    
+    # 保存為numpy文件
+    if bias is not None:
+        np.savez(npz_filename, 
+                filters=weights,
+                bias=bias,
+                filter_stats={
+                    'min': weights.min(),
+                    'max': weights.max(), 
+                    'mean': weights.mean(),
+                    'std': weights.std(),
+                    'zero_ratio': (weights == 0).mean()
+                })
+    else:
+        np.savez(npz_filename, 
+                filters=weights,
+                filter_stats={
+                    'min': weights.min(),
+                    'max': weights.max(),
+                    'mean': weights.mean(), 
+                    'std': weights.std(),
+                    'zero_ratio': (weights == 0).mean()
+                })
+    
+    print(f"\n完整濾波器數據已保存到:")
+    print(f"  - 文本文件: {filename}")
+    print(f"  - NumPy文件: {npz_filename}")
+
+# 可視化所有濾波器
+def visualize_all_filters(model, epoch=None):
+    conv1_weight = model.conv1.weight.data.cpu().numpy()
+    
+    # 創建 4x8 的子圖來顯示所有32個濾波器
+    fig, axes = plt.subplots(4, 8, figsize=(20, 10))
+    fig.suptitle(f'CONV1 all 32 channel visualization (Epoch {epoch if epoch else "初始"})', fontsize=16, y=0.95)
+    
+    # 計算統一的顏色範圍
+    vmax = max(np.abs(conv1_weight.min()), np.abs(conv1_weight.max()))
+    vmin = -vmax
+    
+    for i, ax in enumerate(axes.flat):
+        if i < 32:
+            weights = conv1_weight[i, 0]
+            im = ax.imshow(weights, cmap='RdBu', vmin=vmin, vmax=vmax)
+            ax.set_title(f'Filter {i}', fontsize=10, pad=5)
+            ax.set_xticks([0, 1, 2])
+            ax.set_yticks([0, 1, 2])
+            ax.grid(False)
+            
+            # 在每個格子上顯示數值
+            for row in range(3):
+                for col in range(3):
+                    value = weights[row, col]
+                    color = "black" if abs(value) < vmax * 0.5 else "white"
+                    text = ax.text(col, row, f'{value:.3f}',
+                                 ha="center", va="center", color=color, 
+                                 fontsize=8, fontweight='bold')
+        
+        else:
+            ax.axis('off')
+    
+    # 添加顏色條
+    cbar = fig.colorbar(im, ax=axes, shrink=0.8, pad=0.02)
+    cbar.set_label('weight', rotation=270, labelpad=15)
+    
+    plt.tight_layout()
+    plt.subplots_adjust(top=0.90)
+    plt.show()
+
+# 真實Lasso參數
+lambda_l1 = 1e-5          # L1 強度
+lr_conv1  = 0.01          # conv1 的學習率
+
+model = Net()
+criterion = nn.CrossEntropyLoss()
+
+print("初始 CONV1 全部 32 個濾波器:")
+print_all_conv1_filters(model, "初始")
+visualize_all_filters(model, "初始")
+
+# 只訓練 conv2、fc1、fc2 用 SGD；conv1 由我們手動做 Lasso 近端步驟
+other_params = [p for n, p in model.named_parameters() if not n.startswith('conv1.')]
+optimizer = optim.SGD(other_params, lr=0.01, momentum=0.9)
+
+def soft_threshold(w, thr):
+    return torch.sign(w) * torch.clamp(w.abs() - thr, min=0.0)
+
+# ---- 訓練並定期顯示所有conv1濾波器 ----
+for epoch in range(5):
+    model.train()
+    running_loss = 0.0
+    for i, (inputs, labels) in enumerate(trainloader):
+        optimizer.zero_grad()
+
+        outputs = model(inputs)
+        ce = criterion(outputs, labels)
+        ce.backward()
+
+        # 1) 先更新「非 conv1」參數（SGD）
+        optimizer.step()
+
+        # 2) 對 conv1 做一次「梯度步 + 近端軟閾值」
+        with torch.no_grad():
+            model.conv1.weight -= lr_conv1 * model.conv1.weight.grad
+            if model.conv1.bias is not None:
+                model.conv1.bias   -= lr_conv1 * model.conv1.bias.grad
+
+            model.conv1.weight.copy_(soft_threshold(model.conv1.weight, lr_conv1 * lambda_l1))
+
+            model.conv1.weight.grad.zero_()
+            if model.conv1.bias is not None:
+                model.conv1.bias.grad.zero_()
+
+        running_loss += ce.item()
+        if i % 100 == 99:
+            print(f"[Epoch {epoch+1}, Batch {i+1}] loss: {running_loss/100:.3f}")
+            running_loss = 0.0
+    
+    # 每個epoch結束後顯示所有conv1濾波器
+    print(f"\n{'#'*100}")
+    print(f"Epoch {epoch+1} 結束 - CONV1 全部濾波器")
+    print(f"{'#'*100}")
+    print_all_conv1_filters(model, epoch+1)
+    visualize_all_filters(model, epoch+1)
+
+print("訓練完成")
+
+# ---- 評估準確度 ----
+model.eval()
+correct, total = 0, 0
+with torch.no_grad():
+    for images, labels in testloader:
+        outputs = model(images)
+        pred = outputs.argmax(dim=1)
+        total += labels.size(0)
+        correct += (pred == labels).sum().item()
+print(f"測試集準確率: {100*correct/total:.2f}%")
+
+# 最終conv1所有濾波器顯示
+print(f"\n{'#'*100}")
+print(f"最終模型 CONV1 全部 32 個濾波器")
+print(f"{'#'*100}")
+print_all_conv1_filters(model, "最終")
+visualize_all_filters(model, "最終")
